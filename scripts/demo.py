@@ -37,7 +37,8 @@ def main() -> int:
         wait_ready(c, COLLECTOR)
         print("[demo] 两个服务均已就绪")
 
-        # 分段追加、R2 滞后 0.4s，启动 1.2s 后中断连接 2s
+        # 分段追加、R2 滞后 0.4s，启动 1.2s 后中断连接 2s；
+        # insert_len=20 < 2*seq_len：模拟短插入片段，双端重叠 12 碱基
         scenario = {
             "run_id": RUN_ID,
             "reads": 12,
@@ -47,6 +48,7 @@ def main() -> int:
             "interrupt_at_second": 1.2,
             "interrupt_duration": 2.0,
             "seq_len": 16,
+            "insert_len": 20,
         }
         r = c.post(f"{RELAY}/runs", json=scenario)
         if r.status_code not in (200, 409):
@@ -91,6 +93,48 @@ def main() -> int:
         # 进度总览
         r = c.get(f"{COLLECTOR}/collect/runs/{RUN_ID}")
         print(f"[demo] 最终进度: {r.json()}")
+
+        # 生成单端共识（短插入片段双端合并），轮询直到完成
+        r = c.post(f"{COLLECTOR}/consensus/runs/{RUN_ID}")
+        if r.status_code != 200:
+            print(f"[demo] 触发共识失败: {r.status_code} {r.text}")
+            return 1
+        print(f"[demo] 共识任务已触发: {r.json()}")
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            snap = c.get(f"{COLLECTOR}/consensus/runs/{RUN_ID}").json()
+            if snap["status"] == "completed":
+                break
+            if snap["status"] == "error":
+                print(f"[demo] 共识合成失败: {snap['error']}")
+                return 1
+            time.sleep(0.5)
+        else:
+            print("[demo] 等待共识完成超时")
+            return 1
+        print(f"[demo] 共识完成: 合成 {snap['merged']} 对，"
+              f"未合成 {snap['unmerged']} 对（共 {snap['total']} 对）")
+
+        # 重复触发幂等：计数一致
+        again = c.post(f"{COLLECTOR}/consensus/runs/{RUN_ID}").json()
+        assert again["merged"] == snap["merged"] and \
+            again["unmerged"] == snap["unmerged"], "重复触发计数不一致"
+
+        # 下载共识 FASTQ 并校验：每条序列长度应等于 insert_len
+        r = c.get(f"{COLLECTOR}/consensus/runs/{RUN_ID}/fastq")
+        r.raise_for_status()
+        lines = r.content.decode().splitlines()
+        assert len(lines) == snap["merged"] * 4, "共识行数不符"
+        assert all(lines[i].startswith("@") for i in range(0, len(lines), 4))
+        assert all(len(lines[i + 1]) == scenario["insert_len"]
+                   for i in range(0, len(lines), 4)), "共识长度应等于插入片段长度"
+        assert all(len(lines[i + 1]) == len(lines[i + 3])
+                   for i in range(0, len(lines), 4)), "共识序质长度不等"
+        again_dl = c.get(f"{COLLECTOR}/consensus/runs/{RUN_ID}/fastq").content
+        assert again_dl == r.content, "重复下载内容不一致"
+        print(f"[demo] 共识 FASTQ 下载校验通过: {snap['merged']} 条，"
+              f"{len(r.content)} 字节，重复下载一致")
+
         print("[demo] 全部完成 ✔")
         return 0
 

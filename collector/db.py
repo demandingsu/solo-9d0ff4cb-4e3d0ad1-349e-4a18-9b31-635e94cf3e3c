@@ -32,6 +32,16 @@ CREATE TABLE IF NOT EXISTS pairs (
     PRIMARY KEY (run_id, seq),
     UNIQUE (run_id, name)
 );
+CREATE TABLE IF NOT EXISTS consensus (
+    run_id     TEXT PRIMARY KEY,
+    status     TEXT NOT NULL,            -- running|completed|error
+    total      INTEGER NOT NULL DEFAULT 0,   -- 触发时运行内的总对数
+    merged     INTEGER NOT NULL DEFAULT 0,   -- 成功合成对数
+    unmerged   INTEGER NOT NULL DEFAULT 0,   -- 未合成对数
+    error      TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -123,4 +133,92 @@ def snapshot(row: sqlite3.Row) -> dict[str, Any]:
         "r2_offset": row["r2_offset"],
         "pairs": row["pairs"],
         "error": error,
+    }
+
+
+# ---------------------------------------------------------------- 共识任务
+
+def consensus_get(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM consensus WHERE run_id=?", (run_id,)
+    ).fetchone()
+
+
+def consensus_reset(conn: sqlite3.Connection, run_id: str, total: int, now: float) -> None:
+    """把共识任务（重）置为 running：新建或覆盖旧结果，计数清零。"""
+    conn.execute(
+        "INSERT INTO consensus(run_id, status, total, merged, unmerged, error,"
+        " created_at, updated_at)"
+        " VALUES (?, 'running', ?, 0, 0, NULL, ?, ?)"
+        " ON CONFLICT(run_id) DO UPDATE SET"
+        " status='running', total=excluded.total, merged=0, unmerged=0,"
+        " error=NULL, updated_at=excluded.updated_at",
+        (run_id, total, now, now),
+    )
+    conn.commit()
+
+
+def consensus_progress(
+    conn: sqlite3.Connection, run_id: str, merged: int, unmerged: int, now: float
+) -> None:
+    conn.execute(
+        "UPDATE consensus SET merged=?, unmerged=?, updated_at=? WHERE run_id=?",
+        (merged, unmerged, now, run_id),
+    )
+    conn.commit()
+
+
+def consensus_complete(
+    conn: sqlite3.Connection, run_id: str, merged: int, unmerged: int, now: float
+) -> None:
+    conn.execute(
+        "UPDATE consensus SET status='completed', merged=?, unmerged=?,"
+        " error=NULL, updated_at=? WHERE run_id=?",
+        (merged, unmerged, now, run_id),
+    )
+    conn.commit()
+
+
+def consensus_fail(conn: sqlite3.Connection, run_id: str, error: str, now: float) -> None:
+    conn.execute(
+        "UPDATE consensus SET status='error', error=?, updated_at=? WHERE run_id=?",
+        (error, now, run_id),
+    )
+    conn.commit()
+
+
+def consensus_drop_running(conn: sqlite3.Connection) -> list[str]:
+    """删除所有 running 状态的共识任务（进程重启后清理中断残留）。
+
+    返回被清理的 run_id 列表，调用方据此删除对应的临时文件。
+    """
+    rows = conn.execute(
+        "SELECT run_id FROM consensus WHERE status='running'"
+    ).fetchall()
+    ids = [r["run_id"] for r in rows]
+    if ids:
+        conn.execute("DELETE FROM consensus WHERE status='running'")
+        conn.commit()
+    return ids
+
+
+def fetch_pairs(
+    conn: sqlite3.Connection, run_id: str, min_seq: int, limit: int
+) -> list[sqlite3.Row]:
+    """按配对顺序取一批配对记录（seq 为主键一部分，范围扫描高效）。"""
+    return conn.execute(
+        "SELECT seq, name, r1_record, r2_record FROM pairs"
+        " WHERE run_id=? AND seq>=? ORDER BY seq LIMIT ?",
+        (run_id, min_seq, limit),
+    ).fetchall()
+
+
+def consensus_snapshot(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "run_id": row["run_id"],
+        "status": row["status"],
+        "total": row["total"],
+        "merged": row["merged"],
+        "unmerged": row["unmerged"],
+        "error": row["error"],
     }

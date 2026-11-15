@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import time
 from pathlib import Path
 
@@ -38,6 +39,21 @@ class Scenario(BaseModel):
     )
     interrupt_duration: float = Field(2.0, ge=0, description="中断窗口持续秒数")
     seq_len: int = Field(12, ge=1, le=200)
+    insert_len: int = Field(
+        0, ge=0, le=400,
+        description=">0 时模拟短插入片段：R1/R2 取自同一条 insert 的两端，"
+                    "反向互补后重叠 2*seq_len-insert_len 碱基，可用于共识合成",
+    )
+
+
+def _revcomp(seq: str) -> str:
+    return seq.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+
+
+def _insert(seq_no: int, length: int) -> str:
+    # 确定性伪随机（固定种子），避免周期性序列导致重叠位置不唯一
+    rng = random.Random(f"insert-{seq_no}")
+    return "".join(rng.choice("ACGT") for _ in range(length))
 
 
 def _run_dir(run_id: str) -> Path:
@@ -47,11 +63,16 @@ def _run_dir(run_id: str) -> Path:
     return p
 
 
-def _record(seq_no: int, side: int, seq_len: int) -> bytes:
+def _record(seq_no: int, side: int, seq_len: int, insert_len: int = 0) -> bytes:
     # 确定性的伪序列/质量串，避免引入随机依赖
     name = f"seq{seq_no:05d}/{side}"
-    seq = "".join("ACGT"[(seq_no + i + side) % 4] for i in range(seq_len))
-    qual = "".join(chr(33 + ((seq_no * 7 + i * 3) % 60)) for i in range(seq_len))
+    if insert_len > 0:
+        # 短插入片段：R1 为 insert 前缀，R2 为 insert 后缀的反向互补
+        insert = _insert(seq_no, insert_len)
+        seq = insert[:seq_len] if side == 1 else _revcomp(insert[-seq_len:])
+    else:
+        seq = "".join("ACGT"[(seq_no + i + side) % 4] for i in range(seq_len))
+    qual = "".join(chr(33 + ((seq_no * 7 + i * 3) % 60)) for i in range(len(seq)))
     return f"@{name}\n{seq}\n+\n{qual}\n".encode("ascii")
 
 
@@ -76,12 +97,16 @@ async def _writer(state: dict, sc: Scenario):
         written = 0
         while written < sc.reads:
             nxt = min(written + sc.chunk, sc.reads)
-            blob1 = b"".join(_record(i, 1, sc.seq_len) for i in range(written, nxt))
+            blob1 = b"".join(
+                _record(i, 1, sc.seq_len, sc.insert_len) for i in range(written, nxt)
+            )
             state["r1_bytes"] = await asyncio.to_thread(_flush, r1, blob1, p1)
             state["r1_reads"] = nxt
             # 单端滞后：R2 的写入慢半拍
             await asyncio.sleep(sc.r2_extra_delay)
-            blob2 = b"".join(_record(i, 2, sc.seq_len) for i in range(written, nxt))
+            blob2 = b"".join(
+                _record(i, 2, sc.seq_len, sc.insert_len) for i in range(written, nxt)
+            )
             state["r2_bytes"] = await asyncio.to_thread(_flush, r2, blob2, p2)
             state["r2_reads"] = nxt
             written = nxt

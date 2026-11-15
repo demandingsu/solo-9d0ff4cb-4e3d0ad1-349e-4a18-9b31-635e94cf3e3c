@@ -6,6 +6,9 @@
 * GET  /collect/runs/{id}       查询单次运行进度与错误详情
 * GET  /collect/runs/{id}/R1    下载已配对的 R1（仅 completed 允许）
 * GET  /collect/runs/{id}/R2    下载已配对的 R2（仅 completed 允许）
+* POST /consensus/runs/{id}     按已完成运行生成单端共识（幂等，可重复调用）
+* GET  /consensus/runs/{id}     查询共识任务状态与成功/未合成对数
+* GET  /consensus/runs/{id}/fastq  下载单端共识 FASTQ（仅共识 completed 允许）
 * GET  /healthz                 存活探针
 """
 from __future__ import annotations
@@ -16,10 +19,11 @@ from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import db
+from .consensus_service import ConsensusError, ConsensusManager
 from .service import CollectorService
 
 DB_PATH = os.environ.get("COLLECTOR_DB", "/data/collector.db")
@@ -28,6 +32,9 @@ HTTP_TIMEOUT = float(os.environ.get("COLLECTOR_TIMEOUT", "10"))
 _conn = db.connect(DB_PATH)
 db.init_db(_conn)
 _service = CollectorService(_conn, timeout=HTTP_TIMEOUT)
+_consensus = ConsensusManager(_conn, DB_PATH)
+# 进程重启：清理中断的共识任务（running 行 + 临时文件），之后可重新触发
+_consensus.recover()
 
 
 @asynccontextmanager
@@ -107,4 +114,67 @@ def download(run_id: str, side: int):
         generate(),
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ------------------------------------------------------------------ 共识合成
+
+def _consensus_view(snap: dict) -> dict:
+    if snap["status"] == "completed":
+        snap = {**snap, "fastq_url": f"/consensus/runs/{snap['run_id']}/fastq"}
+    return snap
+
+
+@app.post("/consensus/runs/{run_id}")
+async def trigger_consensus(run_id: str):
+    """按已完成运行号生成单端共识（幂等）。
+
+    已在后台合成或已成功时直接返回当前状态；成功结果重复请求保持一致。
+    """
+    try:
+        snap = await _consensus.trigger(run_id)
+    except ConsensusError as exc:
+        status_code = 404 if exc.code == "run_not_found" else 409
+        raise HTTPException(
+            status_code=status_code,
+            detail={"code": exc.code, "message": str(exc)},
+        )
+    return _consensus_view(snap)
+
+
+@app.get("/consensus/runs/{run_id}")
+def consensus_status(run_id: str):
+    snap = _consensus.status(run_id)
+    if snap is None:
+        raise HTTPException(status_code=404, detail=f"运行 {run_id} 尚未生成共识")
+    return _consensus_view(snap)
+
+
+@app.get("/consensus/runs/{run_id}/fastq")
+def consensus_download(run_id: str):
+    snap = _consensus.status(run_id)
+    if snap is None:
+        raise HTTPException(status_code=404, detail=f"运行 {run_id} 尚未生成共识")
+    if snap["status"] != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "共识尚未合成完成，完成前不提供下载（不会给出半份文件）",
+                "run_id": run_id,
+                "status": snap["status"],
+                "merged": snap["merged"],
+                "unmerged": snap["unmerged"],
+            },
+        )
+    path = _consensus.final_path(run_id)
+    if not os.path.exists(path):
+        # 状态完成但结果文件丢失（如数据卷被清理）：提示重新触发
+        raise HTTPException(
+            status_code=409,
+            detail="共识结果文件缺失，请重新 POST 生成",
+        )
+    return FileResponse(
+        path,
+        media_type="text/plain; charset=utf-8",
+        filename=f"{run_id}_consensus.fastq",
     )
